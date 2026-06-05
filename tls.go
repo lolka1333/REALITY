@@ -291,6 +291,12 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		s2cSaved := make([]byte, 0, size)
 		buf := make([]byte, size)
 		handshakeLen := 0
+		// H1: bound the dest read while mirroring its ServerHello flight. The
+		// per-connection dest socket otherwise has no deadline (MirrorConn's is
+		// a no-op), so a dest that accepts TCP but stalls before ServerHello
+		// hangs the inbound handshake until the OS TCP timeout. Cleared after
+		// the loop, before any long-lived proxying.
+		target.SetReadDeadline(time.Now().Add(15 * time.Second))
 	f:
 		for {
 			runtime.Gosched()
@@ -430,6 +436,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			break
 		}
 		mutex.Unlock()
+		target.SetReadDeadline(time.Time{}) // H1: clear the handshake deadline before any long-lived proxying
 		if hs.c.out.handshakeLen[0] == 0 { // if the target sent an incorrect Server Hello, or before that
 			if hs.c.conn == conn { // if we processed the Client Hello successfully but the target did not
 				waitGroup.Add(1)
