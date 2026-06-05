@@ -448,7 +448,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			break
 		}
 		mutex.Unlock()
-		target.SetReadDeadline(time.Time{}) // H1: clear the handshake deadline before any long-lived proxying
+		// H1: clear the handshake deadline before any long-lived proxying.
+		target.SetReadDeadline(time.Time{})
 		if hs.c.out.handshakeLen[0] == 0 { // if the target sent an incorrect Server Hello, or before that
 			if hs.c.conn == conn { // if we processed the Client Hello successfully but the target did not
 				waitGroup.Add(1)
