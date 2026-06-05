@@ -421,7 +421,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 						break
 					}
 				}
-				time.Sleep(5 * time.Second)
+				time.Sleep(50 * time.Millisecond) // poll: react the moment the probe finishes, not a coarse 5s round-up
 				if maxUseless, ok := GlobalMaxCSSMsgCount.Load(key); ok {
 					hs.c.MaxUselessRecords = maxUseless.(int)
 				}

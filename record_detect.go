@@ -118,8 +118,25 @@ func (c *PostHandshakeRecordDetectConn) Read(b []byte) (n int, err error) {
 	if !c.CcsSent {
 		return c.Conn.Read(b)
 	}
-	c.Conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	data, _ := io.ReadAll(c.Conn)
+	// Collect the dest's post-handshake records, but stop as soon as it goes
+	// quiet — its NewSessionTickets arrive within milliseconds. The original
+	// fixed 5s read deadline made every probe take a full 5s, which stalls the
+	// first real client until the probe finishes (its handshake loop in tls.go
+	// blocks until these lengths are stored). Adaptive read: a short per-read
+	// timeout ends collection on ~200ms of silence, hard-capped at 2s.
+	var data []byte
+	buf := make([]byte, 4096)
+	hardCap := time.Now().Add(2 * time.Second)
+	for time.Now().Before(hardCap) {
+		c.Conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		nn, rerr := c.Conn.Read(buf)
+		if nn > 0 {
+			data = append(data, buf[:nn]...)
+		}
+		if rerr != nil { // timeout (dest quiet) or EOF → done collecting
+			break
+		}
+	}
 	var postHandshakeRecordsLens []int
 	for {
 		if len(data) >= 5 && bytes.Equal(data[:3], []byte{23, 3, 3}) {
