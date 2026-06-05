@@ -415,9 +415,10 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				} else {
 					key += " 1"
 				}
-				// Apply the dest's CCS tolerance as soon as it's known, before
-				// the break below — otherwise it's skipped on the common fast
-				// path where the record lengths are already cached.
+				// Apply the dest's CCS tolerance before the break below so it
+				// isn't skipped on the fast path once known. The CCS probe is
+				// slower than the record probe, so on a cold key the first
+				// connections may fall back to the default until it's captured.
 				if maxUseless, ok := GlobalMaxCSSMsgCount.Load(key); ok {
 					hs.c.MaxUselessRecords = maxUseless.(int)
 				}
