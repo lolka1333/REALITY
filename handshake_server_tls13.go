@@ -75,6 +75,7 @@ var (
 	ed25519Priv       ed25519.PrivateKey
 	signedCert        []byte
 	signedCertMldsa65 []byte
+	mldsa65SigOffset  int // located in init(), not assumed to be a fixed DER offset
 )
 
 func init() {
@@ -83,6 +84,13 @@ func init() {
 	_, ed25519Priv, _ = ed25519.GenerateKey(rand.Reader)
 	signedCert, _ = x509.CreateCertificate(rand.Reader, &certificate, &certificate, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
 	signedCertMldsa65, _ = x509.CreateCertificate(rand.Reader, &certificateMldsa65, &certificateMldsa65, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
+	// Locate the 3309-byte placeholder extension value in the encoded cert
+	// rather than assuming it sits at a fixed offset; this self-corrects if Go's
+	// x509 encoder ever shifts the layout. Fall back to the historical offset if
+	// the placeholder can't be found (keeps behaviour no worse than before).
+	if mldsa65SigOffset = bytes.Index(signedCertMldsa65, empty[:3309]); mldsa65SigOffset < 0 {
+		mldsa65SigOffset = 126
+	}
 }
 
 func (hs *serverHandshakeStateTLS13) handshake() error {
@@ -154,7 +162,7 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 			h.Write(hs.clientHello.original)
 			h.Write(hs.hello.original)
 			key, _ := mldsa65.Scheme().UnmarshalBinaryPrivateKey(c.config.Mldsa65Key)
-			mldsa65.SignTo(key.(*mldsa65.PrivateKey), h.Sum(nil), nil, false, cert[126:]) // fixed location
+			mldsa65.SignTo(key.(*mldsa65.PrivateKey), h.Sum(nil), nil, false, cert[mldsa65SigOffset:])
 		}
 
 		hs.cert = &Certificate{

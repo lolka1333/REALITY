@@ -18,87 +18,132 @@ import (
 var GlobalPostHandshakeRecordsLens sync.Map
 var GlobalMaxCSSMsgCount sync.Map
 
+// Probe cadence: re-probe a working dest occasionally so a long-running server
+// tracks dest-side changes (cert / session-ticket sizes) instead of forever
+// serving a snapshot frozen at startup; retry a failed probe much sooner so a
+// transient blip while the server is starting doesn't leave the mimicry
+// degraded until the next restart.
+const (
+	postHandshakeReprobeInterval = 30 * time.Minute
+	postHandshakeRetryInterval   = time.Minute
+)
+
 func DetectPostHandshakeRecordsLens(config *Config) {
 	for sni := range config.ServerNames {
 		for alpn := range 3 { // 0, 1, 2
 			key := config.Dest + " " + sni + " " + strconv.Itoa(alpn)
 			if _, loaded := GlobalPostHandshakeRecordsLens.LoadOrStore(key, false); !loaded {
-				go func() {
-					defer func() {
-						val, _ := GlobalPostHandshakeRecordsLens.Load(key)
-						if _, ok := val.(bool); ok {
-							GlobalPostHandshakeRecordsLens.Store(key, []int{})
-						}
-					}()
-					target, err := net.Dial(config.Type, config.Dest)
-					if err != nil {
-						return
-					}
-					if config.Xver == 1 || config.Xver == 2 {
-						if _, err = proxyproto.HeaderProxyFromAddrs(config.Xver, target.LocalAddr(), target.RemoteAddr()).WriteTo(target); err != nil {
-							return
-						}
-					}
-					detectConn := &PostHandshakeRecordDetectConn{
-						Conn: target,
-						Key:  key,
-					}
-					fingerprint := utls.HelloChrome_Auto
-					nextProtos := []string{"h2", "http/1.1"}
-					if alpn != 2 {
-						fingerprint = utls.HelloGolang
-					}
-					if alpn == 1 {
-						nextProtos = []string{"http/1.1"}
-					}
-					if alpn == 0 {
-						nextProtos = nil
-					}
-					uConn := utls.UClient(detectConn, &utls.Config{
-						ServerName: sni, // needs new loopvar behaviour
-						NextProtos: nextProtos,
-					}, fingerprint)
-					if err = uConn.Handshake(); err != nil {
-						return
-					}
-					io.Copy(io.Discard, uConn)
-				}()
-				go func() {
-					target, err := net.Dial(config.Type, config.Dest)
-					if err != nil {
-						return
-					}
-					if config.Xver == 1 || config.Xver == 2 {
-						if _, err = proxyproto.HeaderProxyFromAddrs(config.Xver, target.LocalAddr(), target.RemoteAddr()).WriteTo(target); err != nil {
-							return
-						}
-					}
-					fingerprint := utls.HelloChrome_Auto
-					nextProtos := []string{"h2", "http/1.1"}
-					if alpn != 2 {
-						fingerprint = utls.HelloGolang
-					}
-					if alpn == 1 {
-						nextProtos = []string{"http/1.1"}
-					}
-					if alpn == 0 {
-						nextProtos = nil
-					}
-					conn := &CCSDetectConn{
-						Conn: target,
-						Key:  key,
-					}
-					uConn := utls.UClient(conn, &utls.Config{
-						ServerName: sni, // needs new loopvar behaviour
-						NextProtos: nextProtos,
-					}, fingerprint)
-					if err = uConn.Handshake(); err != nil {
-						return
-					}
-				}()
+				// One supervisor per key. sni/alpn travel as arguments rather
+				// than being captured, which also sidesteps the loop-variable
+				// caveat the inline goroutines used to carry.
+				go probePostHandshakeLoop(config, sni, alpn, key)
 			}
 		}
 	}
+}
+
+// probePostHandshakeLoop keeps the cached record / CCS lengths for one
+// (dest, sni, alpn) fresh. It probes, then sleeps for the re-probe interval on
+// success or the shorter retry interval on failure, and loops forever. On a
+// failure before any success it seeds an empty slice so a client polling this
+// key in the handshake path doesn't block while the dest is unreachable; a
+// later successful probe replaces it with the real lengths.
+func probePostHandshakeLoop(config *Config, sni string, alpn int, key string) {
+	everSucceeded := false
+	for {
+		ok := probePostHandshakeRecordLens(config, sni, alpn, key)
+		// CCS tolerance is a stable property of the dest's stack and the probe
+		// emits junk records, so only probe it until it's been captured once.
+		if _, has := GlobalMaxCSSMsgCount.Load(key); !has {
+			probeMaxCSSMsgCount(config, sni, alpn, key)
+		}
+		if ok {
+			everSucceeded = true
+			time.Sleep(postHandshakeReprobeInterval)
+		} else {
+			if !everSucceeded {
+				if val, _ := GlobalPostHandshakeRecordsLens.Load(key); val != nil {
+					if _, isBool := val.(bool); isBool { // still the initial placeholder
+						GlobalPostHandshakeRecordsLens.Store(key, []int{})
+					}
+				}
+			}
+			time.Sleep(postHandshakeRetryInterval)
+		}
+	}
+}
+
+// probeProtos picks the uTLS fingerprint and ALPN list for the given alpn index
+// (shared by both probes).
+func probeProtos(alpn int) (utls.ClientHelloID, []string) {
+	fingerprint := utls.HelloChrome_Auto
+	nextProtos := []string{"h2", "http/1.1"}
+	if alpn != 2 {
+		fingerprint = utls.HelloGolang
+	}
+	if alpn == 1 {
+		nextProtos = []string{"http/1.1"}
+	}
+	if alpn == 0 {
+		nextProtos = nil
+	}
+	return fingerprint, nextProtos
+}
+
+// probePostHandshakeRecordLens runs one record-length probe against the dest.
+// It returns true iff the TLS handshake to the dest completed — in which case
+// PostHandshakeRecordDetectConn has stored the observed lengths for key. A
+// failed dial/handshake returns false so the supervisor retries.
+func probePostHandshakeRecordLens(config *Config, sni string, alpn int, key string) bool {
+	target, err := net.Dial(config.Type, config.Dest)
+	if err != nil {
+		return false
+	}
+	defer target.Close()
+	if config.Xver == 1 || config.Xver == 2 {
+		if _, err = proxyproto.HeaderProxyFromAddrs(config.Xver, target.LocalAddr(), target.RemoteAddr()).WriteTo(target); err != nil {
+			return false
+		}
+	}
+	detectConn := &PostHandshakeRecordDetectConn{
+		Conn: target,
+		Key:  key,
+	}
+	fingerprint, nextProtos := probeProtos(alpn)
+	uConn := utls.UClient(detectConn, &utls.Config{
+		ServerName: sni,
+		NextProtos: nextProtos,
+	}, fingerprint)
+	if err = uConn.Handshake(); err != nil {
+		return false
+	}
+	io.Copy(io.Discard, uConn)
+	return true
+}
+
+// probeMaxCSSMsgCount runs one ChangeCipherSpec-tolerance probe against the
+// dest; CCSDetectConn stores the result for key during the handshake.
+func probeMaxCSSMsgCount(config *Config, sni string, alpn int, key string) {
+	target, err := net.Dial(config.Type, config.Dest)
+	if err != nil {
+		return
+	}
+	defer target.Close()
+	if config.Xver == 1 || config.Xver == 2 {
+		if _, err = proxyproto.HeaderProxyFromAddrs(config.Xver, target.LocalAddr(), target.RemoteAddr()).WriteTo(target); err != nil {
+			return
+		}
+	}
+	conn := &CCSDetectConn{
+		Conn: target,
+		Key:  key,
+	}
+	fingerprint, nextProtos := probeProtos(alpn)
+	uConn := utls.UClient(conn, &utls.Config{
+		ServerName: sni,
+		NextProtos: nextProtos,
+	}, fingerprint)
+	uConn.Handshake()
 }
 
 type PostHandshakeRecordDetectConn struct {
@@ -150,7 +195,18 @@ func (c *PostHandshakeRecordDetectConn) Read(b []byte) (n int, err error) {
 			break
 		}
 	}
-	GlobalPostHandshakeRecordsLens.Store(c.Key, postHandshakeRecordsLens)
+	if len(postHandshakeRecordsLens) > 0 {
+		GlobalPostHandshakeRecordsLens.Store(c.Key, postHandshakeRecordsLens)
+	} else {
+		// An empty result (dest happened to be quiet this round) may only
+		// overwrite the initial placeholder, never a previously captured
+		// non-empty snapshot — otherwise a re-probe could degrade good mimicry.
+		if val, ok := GlobalPostHandshakeRecordsLens.Load(c.Key); !ok {
+			GlobalPostHandshakeRecordsLens.Store(c.Key, postHandshakeRecordsLens)
+		} else if _, isBool := val.(bool); isBool {
+			GlobalPostHandshakeRecordsLens.Store(c.Key, postHandshakeRecordsLens)
+		}
+	}
 	return 0, io.EOF
 }
 

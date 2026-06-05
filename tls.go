@@ -379,10 +379,14 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				break
 			}
 			go func() { // TODO: Probe some time-outs in advance.
+				// Private buffer: `buf` backs hs.c.out.handshakeBuf (the
+				// cert-coalescing writer), so draining dest bytes into it here
+				// would race that writer on the same backing array.
+				probeBuf := make([]byte, len(buf))
 				if handshakeLen-len(s2cSaved) > 0 {
-					io.ReadFull(target, buf[:handshakeLen-len(s2cSaved)])
+					io.ReadFull(target, probeBuf[:handshakeLen-len(s2cSaved)])
 				}
-				if n, err := target.Read(buf); !hs.c.isHandshakeComplete.Load() {
+				if n, err := target.Read(probeBuf); !hs.c.isHandshakeComplete.Load() {
 					if err != nil {
 						conn.Close()
 					}
@@ -398,7 +402,10 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			if err != nil {
 				break
 			}
-			for {
+			// Bound the wait: the probe normally completes within ~2s. If it
+			// is somehow stuck, stop polling after ~5s and serve the client
+			// without forged post-handshake records rather than hang forever.
+			for pollWaited := time.Duration(0); pollWaited < 5*time.Second; pollWaited += 50 * time.Millisecond {
 				key := config.Dest + " " + hs.clientHello.serverName
 				if len(hs.clientHello.alpnProtocols) == 0 {
 					key += " 0"
