@@ -2,6 +2,7 @@ package reality
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"math"
@@ -18,37 +19,57 @@ import (
 var GlobalPostHandshakeRecordsLens sync.Map
 var GlobalMaxCSSMsgCount sync.Map
 
-// Probe cadence: re-probe a working dest occasionally so a long-running server
-// tracks dest-side changes (cert / session-ticket sizes) instead of forever
-// serving a snapshot frozen at startup; retry a failed probe much sooner so a
-// transient blip while the server is starting doesn't leave the mimicry
-// degraded until the next restart.
 const (
+	// Probe cadence: re-probe a working dest occasionally so a long-running
+	// server tracks dest-side changes (cert / session-ticket sizes) instead of
+	// forever serving a snapshot frozen at startup; retry a failed probe much
+	// sooner so a transient blip at startup doesn't leave the mimicry degraded
+	// until the next restart.
 	postHandshakeReprobeInterval = 30 * time.Minute
 	postHandshakeRetryInterval   = time.Minute
+
+	// Adaptive probe-read tuning (see PostHandshakeRecordDetectConn.Read).
+	probeReadChunk    = 4096                   // per-read buffer size
+	probeQuietTimeout = 200 * time.Millisecond // dest silence that ends collection
+	probeHardCap      = 2 * time.Second        // absolute cap on one collection
+
+	// Handshake-path tuning (see Server in tls.go).
+	destHandshakeReadDeadline = 15 * time.Second      // bound on mirroring the dest's ServerHello flight
+	postHandshakePollBudget   = 5 * time.Second       // max wait for the probe before serving without mimicry
+	postHandshakePollInterval = 50 * time.Millisecond // poll granularity while waiting
 )
 
+// DetectPostHandshakeRecordsLens probes the dest for the whole process lifetime.
+// Prefer DetectPostHandshakeRecordsLensContext when a cancellation scope is
+// available (e.g. a listener's context) so the probe goroutines stop with it.
 func DetectPostHandshakeRecordsLens(config *Config) {
+	DetectPostHandshakeRecordsLensContext(context.Background(), config)
+}
+
+// DetectPostHandshakeRecordsLensContext starts one supervisor goroutine per
+// (dest, sni, alpn) key, each keeping that key's cached lengths fresh until ctx
+// is cancelled.
+func DetectPostHandshakeRecordsLensContext(ctx context.Context, config *Config) {
 	for sni := range config.ServerNames {
 		for alpn := range 3 { // 0, 1, 2
 			key := config.Dest + " " + sni + " " + strconv.Itoa(alpn)
 			if _, loaded := GlobalPostHandshakeRecordsLens.LoadOrStore(key, false); !loaded {
-				// One supervisor per key. sni/alpn travel as arguments rather
-				// than being captured, which also sidesteps the loop-variable
-				// caveat the inline goroutines used to carry.
-				go probePostHandshakeLoop(config, sni, alpn, key)
+				// sni/alpn travel as arguments rather than being captured, which
+				// also sidesteps the loop-variable caveat the inline goroutines
+				// used to carry.
+				go probePostHandshakeLoop(ctx, config, sni, alpn, key)
 			}
 		}
 	}
 }
 
 // probePostHandshakeLoop keeps the cached record / CCS lengths for one
-// (dest, sni, alpn) fresh. It probes, then sleeps for the re-probe interval on
-// success or the shorter retry interval on failure, and loops forever. On a
-// failure before any success it seeds an empty slice so a client polling this
-// key in the handshake path doesn't block while the dest is unreachable; a
-// later successful probe replaces it with the real lengths.
-func probePostHandshakeLoop(config *Config, sni string, alpn int, key string) {
+// (dest, sni, alpn) fresh: it probes, then waits the re-probe interval on
+// success or the shorter retry interval on failure, and loops until ctx is
+// cancelled. On a failure before any success it seeds an empty slice so a
+// client polling this key in the handshake path doesn't block while the dest is
+// unreachable; a later successful probe replaces it with the real lengths.
+func probePostHandshakeLoop(ctx context.Context, config *Config, sni string, alpn int, key string) {
 	everSucceeded := false
 	for {
 		ok := probePostHandshakeRecordLens(config, sni, alpn, key)
@@ -57,19 +78,30 @@ func probePostHandshakeLoop(config *Config, sni string, alpn int, key string) {
 		if _, has := GlobalMaxCSSMsgCount.Load(key); !has {
 			probeMaxCSSMsgCount(config, sni, alpn, key)
 		}
+		interval := postHandshakeRetryInterval
 		if ok {
 			everSucceeded = true
-			time.Sleep(postHandshakeReprobeInterval)
-		} else {
-			if !everSucceeded {
-				if val, _ := GlobalPostHandshakeRecordsLens.Load(key); val != nil {
-					if _, isBool := val.(bool); isBool { // still the initial placeholder
-						GlobalPostHandshakeRecordsLens.Store(key, []int{})
-					}
-				}
-			}
-			time.Sleep(postHandshakeRetryInterval)
+			interval = postHandshakeReprobeInterval
+		} else if !everSucceeded {
+			storeEmptyIfPlaceholder(key)
 		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
+		}
+	}
+}
+
+// storeEmptyIfPlaceholder records an empty length list for key, but only while
+// the entry is still the initial bool placeholder — it never overwrites real
+// lengths captured by an earlier successful probe. This is the "dest momentarily
+// unreachable or quiet" fallback that keeps a polling client from blocking.
+func storeEmptyIfPlaceholder(key string) {
+	if v, ok := GlobalPostHandshakeRecordsLens.Load(key); !ok {
+		GlobalPostHandshakeRecordsLens.Store(key, []int{})
+	} else if _, isPlaceholder := v.(bool); isPlaceholder {
+		GlobalPostHandshakeRecordsLens.Store(key, []int{})
 	}
 }
 
@@ -170,10 +202,10 @@ func (c *PostHandshakeRecordDetectConn) Read(b []byte) (n int, err error) {
 	// blocks until these lengths are stored). Adaptive read: a short per-read
 	// timeout ends collection on ~200ms of silence, hard-capped at 2s.
 	var data []byte
-	buf := make([]byte, 4096)
-	hardCap := time.Now().Add(2 * time.Second)
+	buf := make([]byte, probeReadChunk)
+	hardCap := time.Now().Add(probeHardCap)
 	for time.Now().Before(hardCap) {
-		c.Conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		c.Conn.SetReadDeadline(time.Now().Add(probeQuietTimeout))
 		nn, rerr := c.Conn.Read(buf)
 		if nn > 0 {
 			data = append(data, buf[:nn]...)
@@ -198,14 +230,9 @@ func (c *PostHandshakeRecordDetectConn) Read(b []byte) (n int, err error) {
 	if len(postHandshakeRecordsLens) > 0 {
 		GlobalPostHandshakeRecordsLens.Store(c.Key, postHandshakeRecordsLens)
 	} else {
-		// An empty result (dest happened to be quiet this round) may only
-		// overwrite the initial placeholder, never a previously captured
-		// non-empty snapshot — otherwise a re-probe could degrade good mimicry.
-		if val, ok := GlobalPostHandshakeRecordsLens.Load(c.Key); !ok {
-			GlobalPostHandshakeRecordsLens.Store(c.Key, postHandshakeRecordsLens)
-		} else if _, isBool := val.(bool); isBool {
-			GlobalPostHandshakeRecordsLens.Store(c.Key, postHandshakeRecordsLens)
-		}
+		// An empty result (dest was quiet this round) may only replace the
+		// placeholder, never a previously captured non-empty snapshot.
+		storeEmptyIfPlaceholder(c.Key)
 	}
 	return 0, io.EOF
 }

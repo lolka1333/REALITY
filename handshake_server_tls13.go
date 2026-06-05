@@ -71,6 +71,8 @@ type serverHandshakeStateTLS13 struct {
 	echContext      *echServerContext
 }
 
+const mldsa65SigSize = 3309 // ML-DSA-65 signature length == the placeholder extension value size
+
 var (
 	ed25519Priv       ed25519.PrivateKey
 	signedCert        []byte
@@ -80,15 +82,15 @@ var (
 
 func init() {
 	certificate := x509.Certificate{SerialNumber: &big.Int{}}
-	certificateMldsa65 := x509.Certificate{SerialNumber: &big.Int{}, ExtraExtensions: []pkix.Extension{{Id: []int{0, 0}, Value: empty[:3309]}}}
+	certificateMldsa65 := x509.Certificate{SerialNumber: &big.Int{}, ExtraExtensions: []pkix.Extension{{Id: []int{0, 0}, Value: empty[:mldsa65SigSize]}}}
 	_, ed25519Priv, _ = ed25519.GenerateKey(rand.Reader)
 	signedCert, _ = x509.CreateCertificate(rand.Reader, &certificate, &certificate, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
 	signedCertMldsa65, _ = x509.CreateCertificate(rand.Reader, &certificateMldsa65, &certificateMldsa65, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
-	// Locate the 3309-byte placeholder extension value in the encoded cert
-	// rather than assuming it sits at a fixed offset; this self-corrects if Go's
-	// x509 encoder ever shifts the layout. Fall back to the historical offset if
-	// the placeholder can't be found (keeps behaviour no worse than before).
-	if mldsa65SigOffset = bytes.Index(signedCertMldsa65, empty[:3309]); mldsa65SigOffset < 0 {
+	// Locate the placeholder extension value in the encoded cert rather than
+	// assuming it sits at a fixed offset; this self-corrects if Go's x509
+	// encoder ever shifts the layout. Fall back to the historical offset if the
+	// placeholder can't be found (keeps behaviour no worse than before).
+	if mldsa65SigOffset = bytes.Index(signedCertMldsa65, empty[:mldsa65SigSize]); mldsa65SigOffset < 0 {
 		mldsa65SigOffset = 126
 	}
 }

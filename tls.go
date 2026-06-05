@@ -296,7 +296,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		// a no-op), so a dest that accepts TCP but stalls before ServerHello
 		// hangs the inbound handshake until the OS TCP timeout. Cleared after
 		// the loop, before any long-lived proxying.
-		target.SetReadDeadline(time.Now().Add(15 * time.Second))
+		target.SetReadDeadline(time.Now().Add(destHandshakeReadDeadline))
 	f:
 		for {
 			runtime.Gosched()
@@ -403,9 +403,10 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				break
 			}
 			// Bound the wait: the probe normally completes within ~2s. If it
-			// is somehow stuck, stop polling after ~5s and serve the client
-			// without forged post-handshake records rather than hang forever.
-			for pollWaited := time.Duration(0); pollWaited < 5*time.Second; pollWaited += 50 * time.Millisecond {
+			// is somehow stuck, stop polling after the budget and serve the
+			// client without forged post-handshake records rather than hang.
+			pollDeadline := time.Now().Add(postHandshakePollBudget)
+			for time.Now().Before(pollDeadline) {
 				key := config.Dest + " " + hs.clientHello.serverName
 				if len(hs.clientHello.alpnProtocols) == 0 {
 					key += " 0"
@@ -413,6 +414,12 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					key += " 2"
 				} else {
 					key += " 1"
+				}
+				// Apply the dest's CCS tolerance as soon as it's known, before
+				// the break below — otherwise it's skipped on the common fast
+				// path where the record lengths are already cached.
+				if maxUseless, ok := GlobalMaxCSSMsgCount.Load(key); ok {
+					hs.c.MaxUselessRecords = maxUseless.(int)
 				}
 				if val, ok := GlobalPostHandshakeRecordsLens.Load(key); ok {
 					if postHandshakeRecordsLens, ok := val.([]int); ok {
@@ -434,10 +441,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 						break
 					}
 				}
-				time.Sleep(50 * time.Millisecond) // poll: react the moment the probe finishes, not a coarse 5s round-up
-				if maxUseless, ok := GlobalMaxCSSMsgCount.Load(key); ok {
-					hs.c.MaxUselessRecords = maxUseless.(int)
-				}
+				time.Sleep(postHandshakePollInterval)
 			}
 			hs.c.isHandshakeComplete.Store(true)
 			break
